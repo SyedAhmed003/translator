@@ -1,11 +1,23 @@
+from __future__ import annotations
 
 import json
 from pathlib import Path
+import io
+import math
+from typing import TYPE_CHECKING
 import pymupdf as fitz
+from PIL import Image, ImageDraw, ImageFont
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = None
+    np = None
 
 from .fonts import choose_font, is_bold
 from .validator import validate_page
-from .image_translator import ImageTextRegion
+if TYPE_CHECKING:
+    from .image_translator import ImageTextRegion
 
 
 def _font_spec(fontfile):
@@ -278,64 +290,189 @@ def _image_text_font_size(region: ImageTextRegion, translation: str, fontfile: s
     return max(4.8, minimum), True
 
 
-def render_image_text_regions(page, regions, min_font_scale=0.90):
+def _image_font_path():
+    candidates = [
+        Path(__file__).resolve().parents[1] / "fonts" / "NotoSans-Regular.ttf",
+        Path("C:/Windows/Fonts/arial.ttf"),
+        Path("C:/Windows/Fonts/segoeui.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def _wrap_pixels(draw, text, font, width):
+    text = (text or "").replace("\n", " ").strip()
+    if not text:
+        return []
+    if " " not in text:
+        words = list(text)
+    else:
+        words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        candidate = word if not current else current + ("" if " " not in text else " ") + word
+        box = draw.textbbox((0, 0), candidate, font=font)
+        if box[2] - box[0] <= width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        # Break a single over-wide token/character sequence.
+        piece = ""
+        for ch in word:
+            candidate2 = piece + ch
+            box2 = draw.textbbox((0, 0), candidate2, font=font)
+            if box2[2] - box2[0] <= width:
+                piece = candidate2
+            else:
+                if piece:
+                    lines.append(piece)
+                piece = ch
+        current = piece
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _fit_image_text(draw, text, bbox, font_path, min_scale=0.90):
+    x0, y0, x1, y1 = bbox
+    width = max(8, x1 - x0 - 4)
+    height = max(8, y1 - y0 - 4)
+    start = max(8, int(height * 0.78))
+    minimum = max(7, int(start * min_scale))
+    chosen = None
+    for size in range(start, minimum - 1, -1):
+        font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+        lines = _wrap_pixels(draw, text, font, width)
+        if not lines:
+            continue
+        boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
+        line_h = max(1, max(b[3] - b[1] for b in boxes))
+        spacing = max(1, int(line_h * 0.08))
+        total_h = len(lines) * line_h + (len(lines) - 1) * spacing
+        if total_h <= height:
+            chosen = (font, lines, line_h, spacing, False)
+            break
+    if chosen is not None:
+        return chosen
+    size = minimum
+    font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+    lines = _wrap_pixels(draw, text, font, width)[:max(1, int(height / max(1, size)))]
+    boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
+    line_h = max(1, max((b[3] - b[1] for b in boxes), default=size))
+    spacing = max(1, int(line_h * 0.05))
+    return font, lines, line_h, spacing, True
+
+
+def _inpaint_image(image: Image.Image, regions):
+    """Remove only the source-text pixels; keep all other image content intact."""
+    rgba = image.convert("RGBA")
+    rgb = np.array(rgba.convert("RGB")) if np is not None else None
+    mask = None
+    if cv2 is not None and np is not None:
+        mask = np.zeros((rgba.height, rgba.width), dtype=np.uint8)
+        for region in regions:
+            x0, y0, x1, y1 = [int(round(v)) for v in region.bbox_px]
+            pad = max(1, int(round(min(rgba.width, rgba.height) * 0.0025)))
+            x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
+            x1 = min(rgba.width - 1, x1 + pad); y1 = min(rgba.height - 1, y1 + pad)
+            cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
+        if np.any(mask):
+            restored = cv2.inpaint(rgb, mask, 3.0, cv2.INPAINT_TELEA)
+            out = Image.fromarray(restored).convert("RGBA")
+            out.putalpha(rgba.getchannel("A"))
+            return out
+
+    # Dependency-free fallback for simple document images: use a local median
+    # border colour instead of a hard white rectangle.
+    out = rgba.copy()
+    px = out.load()
+    for region in regions:
+        x0, y0, x1, y1 = [int(round(v)) for v in region.bbox_px]
+        x0 = max(0, x0); y0 = max(0, y0); x1 = min(out.width, x1); y1 = min(out.height, y1)
+        samples = []
+        for x in range(x0, min(x1, x0 + max(1, (x1-x0)//8))):
+            if y0 > 0: samples.append(px[x, y0-1][:3])
+            if y1 < out.height: samples.append(px[x, y1][:3])
+        for y in range(y0, min(y1, y0 + max(1, (y1-y0)//8))):
+            if x0 > 0: samples.append(px[x0-1, y][:3])
+            if x1 < out.width: samples.append(px[x1, y][:3])
+        if not samples:
+            continue
+        bg = tuple(sorted(c[i] for c in samples)[len(samples)//2] for i in range(3))
+        for yy in range(y0, y1):
+            for xx in range(x0, x1):
+                alpha = px[xx, yy][3]
+                px[xx, yy] = (*bg, alpha)
+    return out
+
+
+def _render_image_occurrence(doc, page, xref, rect, regions):
+    extracted = doc.extract_image(xref)
+    if not extracted or not extracted.get("image"):
+        return False
+    try:
+        image = Image.open(io.BytesIO(extracted["image"]))
+    except Exception:
+        return False
+    source_image = image.convert("RGBA")
+    image = _inpaint_image(source_image, regions)
+    draw = ImageDraw.Draw(image)
+    font_path = _image_font_path()
+    for region in sorted(regions, key=lambda r: (r.bbox_px[1], r.bbox_px[0])):
+        bbox = region.bbox_px
+        font, lines, line_h, spacing, _ = _fit_image_text(draw, region.translation, bbox, font_path, 0.88)
+        x0, y0, x1, y1 = bbox
+        pad = max(1, int(round(min(image.width, image.height) * 0.004)))
+        x = max(0, int(round(x0)) + pad)
+        y = max(0, int(round(y0)) + pad)
+        for line in lines:
+            draw.text((x, y), line, font=font, fill=(0, 0, 0, 255))
+            y += line_h + spacing
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", optimize=True)
+    page.insert_image(rect, stream=buf.getvalue(), overlay=True)
+    return True
+
+
+def render_image_text_regions(page, regions, min_font_scale=0.60):
+    if not regions:
+        return [], []
     rendered = []
     warnings = []
+    grouped = {}
     for region in regions:
-        rect = fitz.Rect(region.page_bbox)
-        if rect.is_empty or rect.width < 2 or rect.height < 2:
+        grouped.setdefault((region.xref, region.occurrence_index), []).append(region)
+
+    doc = page.parent
+    for (xref, occurrence_index), group in grouped.items():
+        rects = page.get_image_rects(xref)
+        if occurrence_index >= len(rects):
             continue
-
-        # Keep the original embedded image object untouched. The white patch
-        # only masks the old glyphs visually; image dimensions/placement are
-        # never changed. This is appropriate for scanned documents and image
-        # snippets with a paper/white background.
-        page.draw_rect(rect, color=None, fill=(1, 1, 1), overlay=True)
-
-        fontfile = choose_font(False)
-        size, tight = _image_text_font_size(region, region.translation, fontfile, min_font_scale)
-        fontname, embedded = _font_spec(fontfile)
-        kwargs = dict(
-            fontname=fontname,
-            fontsize=size,
-            align=0,
-            color=(0, 0, 0),
-            lineheight=0.95,
-        )
-        if embedded:
-            kwargs["fontfile"] = embedded
-
-        result = page.insert_textbox(
-            rect,
-            region.translation,
-            **kwargs,
-        )
-        warning = None
-        if result < 0:
-            # Retry with a smaller size while keeping the exact region.
-            retry_size = size
-            while result < 0 and retry_size > 4.5:
-                retry_size -= 0.2
-                kwargs["fontsize"] = retry_size
-                result = page.insert_textbox(rect, region.translation, **kwargs)
-            size = retry_size
-        if result < 0 or tight:
-            warning = "Image text was fitted at the minimum local font size."
+        rect = rects[occurrence_index]
+        ok = _render_image_occurrence(doc, page, xref, rect, group)
+        if not ok:
             warnings.append({
-                "page": region.page_index + 1,
-                "unit_id": region.region_id,
-                "warning": warning,
+                "page": page.number + 1,
+                "unit_id": f"p{page.number + 1}_img{xref}_{occurrence_index}",
+                "warning": "Image text was detected but the image could not be rebuilt in-place.",
             })
-
-        rendered.append({
-            "id": region.region_id,
-            "source": region.source_text,
-            "translation": region.translation,
-            "bbox": list(rect),
-            "font_size": size,
-            "confidence": region.confidence,
-            "warning": warning,
-        })
+            continue
+        for region in group:
+            rendered.append({
+                "id": region.region_id,
+                "source": region.source_text,
+                "translation": region.translation,
+                "bbox": list(region.page_bbox),
+                "font_size": None,
+                "confidence": region.confidence,
+                "warning": None,
+            })
     return rendered, warnings
 
 
@@ -346,7 +483,7 @@ def render_translated_pdf(
     translations,
     all_page_lines=None,
     image_regions=None,
-    min_font_scale=0.90,
+    min_font_scale=0.60,
     font_scale_step=0.02,
     text_margin=0.0,
 ):
@@ -454,37 +591,45 @@ def render_translated_pdf(
                 if overflow:
                     warning = "Cell required minimum font-size fallback."
             else:
-                slots, size, overflow = _fit_unit_lines(
-                    u, translation, fontfile, min_font_scale
-                )
-                if overflow:
-                    # Never paint outside the original region. Instead use a
-                    # conservative local fit and flag it for review.
+                # Translate the whole logical block into the original union
+                # rectangle. The older line-by-line fitting used every source
+                # line's Japanese width as an independent English column, which
+                # produced uneven alignment and premature font shrinking.
+                rect = fitz.Rect(u.bbox)
+                max_lines = max(1, len(u.lines))
+                align = 1 if u.kind == "title" else 0
+                size = u.size
+                minimum = max(5.2, u.size * min_font_scale)
+                chosen_lines = None
+                while size >= minimum - 1e-6:
+                    lines = _wrap(translation, max(8.0, rect.width), fontfile, size)
+                    asc, desc = _metrics(fontfile, size)
+                    line_h = max(1.0, asc - desc) * 1.02
+                    if lines and len(lines) <= max_lines and len(lines) * line_h <= rect.height + 0.5:
+                        chosen_lines = lines
+                        break
+                    size -= 0.15
+                if chosen_lines is None:
+                    size = minimum
+                    chosen_lines = _wrap(translation, max(8.0, rect.width), fontfile, size)
                     warning = (
-                        "English is longer than the original region at the minimum "
-                        "font scale; content was kept inside the original region."
+                        "Translation exceeded the original text box at the minimum "
+                        "font scale; it was constrained to the original region."
                     )
-                    # Use a single compact textbox inside the original region.
-                    # This avoids overlaps with the next paragraph.
-                    rect = fitz.Rect(
-                        u.bbox[0], u.bbox[1], u.bbox[2], u.bbox[3]
-                    )
-                    fontname, embedded = _font_spec(fontfile)
-                    kwargs = dict(
-                        fontname=fontname,
-                        fontsize=size,
-                        align=0,
-                        color=(0, 0, 0),
-                        lineheight=0.95,
-                    )
-                    if embedded:
-                        kwargs["fontfile"] = embedded
-                    page.insert_textbox(rect, translation, **kwargs)
-                else:
-                    align = 1 if u.kind == "title" else 0
-                    for i, txt in enumerate(slots):
-                        if txt:
-                            _insert_line(page, u.lines[i], txt, size, fontfile, align)
+                    if len(chosen_lines) > max_lines:
+                        chosen_lines = chosen_lines[:max_lines]
+                asc, desc = _metrics(fontfile, size)
+                line_h = max(1.0, asc - desc) * 1.02
+                first_baseline = rect.y0 + asc
+                for i, txt in enumerate(chosen_lines):
+                    if not txt:
+                        continue
+                    width = measure(txt, fontfile, size)
+                    if align == 1:
+                        x = rect.x0 + max(0.0, (rect.width - width) / 2.0)
+                    else:
+                        x = rect.x0
+                    _insert_text(page, (x, first_baseline + i * line_h), txt, size, fontfile)
 
             page_report["units"].append({
                 "id": u.unit_id,

@@ -178,7 +178,7 @@ with e2:
 st.markdown('<div class="section-title">📐 Layout controls</div>', unsafe_allow_html=True)
 l1, l2 = st.columns(2)
 with l1:
-    min_scale = st.slider("Minimum font scale", 0.70, 1.00, 0.90, 0.01, help="Reduce font size only when translated text cannot fit inside the original text geometry.")
+    min_scale = st.slider("Minimum font scale", 0.55, 1.00, 0.60, 0.01, help="Reduce font size only when translated text cannot fit inside the original text geometry.")
 with l2:
     margin = st.slider("Text fitting margin", 0.0, 5.0, 0.0, 0.25, help="Keep at 0 for maximum source-PDF geometry fidelity.")
 

@@ -13,6 +13,7 @@ from .renderer import render_translated_pdf, detect_table_grids
 from .segmenter import segment_lines
 from .translator import OpenRouterTranslator
 from .image_translator import OpenRouterVisionTranslator, ImageTextRegion
+from .full_page_image_translator import FullPageVisionTranslator
 
 
 def _mode(value: str) -> str:
@@ -23,11 +24,12 @@ def _mode(value: str) -> str:
     }.get(value, "auto")
 
 
-def _extract(input_path, source_language, extraction_mode, ocr_dpi, vision_translator=None):
+def _extract(input_path, source_language, extraction_mode, ocr_dpi, vision_translator=None, full_page_vision_translator=None):
     doc = fitz.open(input_path)
     all_units = []
     all_page_lines = {}
     all_image_regions: list[ImageTextRegion] = []
+    all_full_page_images = {}
     modes = []
     analysis = analyze_pdf(input_path)
     for page_index, page in enumerate(doc):
@@ -41,23 +43,28 @@ def _extract(input_path, source_language, extraction_mode, ocr_dpi, vision_trans
             for rect in page.get_image_rects(img[0]):
                 image_area += max(0.0, rect.width * rect.height)
         image_ratio = min(1.0, image_area / page_area)
-        image_dominant = vision_translator is not None and image_ratio >= 0.72 and page_text_chars < 80
+        image_dominant = full_page_vision_translator is not None and image_ratio >= 0.72 and page_text_chars < 80
 
         if image_dominant:
             from .hybrid_extractor import ExtractionResult
             extraction = ExtractionResult(
-                lines=[], mode="openrouter-vision", ocr_used=True, confidence=0.0,
-                note=f"Image-dominant page ({image_ratio:.0%}); OpenRouter vision OCR used."
+                lines=[], mode="openrouter-full-page-vision", ocr_used=True, confidence=0.0,
+                note=f"Image-dominant page ({image_ratio:.0%}); full-page OpenRouter vision used."
             )
+            full_page = full_page_vision_translator.translate_page(page, page_index)
+            all_full_page_images[page_index] = full_page
+            # Do not also inspect individual PDF image xrefs. Some scanned PDFs contain
+            # duplicate/overlapping full-page image objects; processing them separately
+            # causes double rendering and stale image layers.
+            page_image_regions = []
         else:
             extraction = extract_page_hybrid(page, source_language, mode=_mode(extraction_mode), ocr_dpi=ocr_dpi)
+            page_image_regions = vision_translator.extract_page_regions(page, page_index) if vision_translator is not None else []
         lines = extraction.lines
         all_page_lines[page_index] = lines
         grids = detect_table_grids(page)
         units = segment_lines(lines, page_index, source_language, grids, page.rect.width)
-        if vision_translator is not None:
-            page_image_regions = vision_translator.extract_page_regions(page, page_index)
-            all_image_regions.extend(page_image_regions)
+        all_image_regions.extend(page_image_regions)
         all_units.extend(units)
         modes.append({
             "page": page_index + 1,
@@ -68,13 +75,14 @@ def _extract(input_path, source_language, extraction_mode, ocr_dpi, vision_trans
             "units": len(units),
             "image_text_regions": sum(1 for r in all_image_regions if r.page_index == page_index),
             "image_ratio": round(image_ratio, 4),
+            "full_page_vision": image_dominant,
         })
     doc.close()
-    return analysis, all_units, all_page_lines, modes, all_image_regions
+    return analysis, all_units, all_page_lines, modes, all_image_regions, all_full_page_images
 
 
 def inspect_document(input_path: str, report_path: str | None = None, source_language: str = "Japanese"):
-    analysis, units, _, modes, image_regions = _extract(input_path, source_language, "Auto (MuPDF → OCR when needed)", 300, None)
+    analysis, units, _, modes, image_regions, _ = _extract(input_path, source_language, "Auto (MuPDF → OCR when needed)", 300, None, None)
     result = {
         "analysis": analysis,
         "extraction": modes,
@@ -118,20 +126,29 @@ def translate_document_with_options(
         raise RuntimeError("Source and target languages must be different.")
 
     vision = None
+    full_page_vision = None
     if use_vision_images:
-        vision = OpenRouterVisionTranslator(
+        common = dict(
             api_key=api_key,
             model=model,
             source_language=source_language,
             target_language=target_language,
-            max_image_edge=max_image_edge,
             http_referer=settings.openrouter_http_referer,
             app_name=settings.openrouter_app_name,
         )
-    analysis, units, all_page_lines, extraction, image_regions = _extract(
-        input_path, source_language, extraction_mode, ocr_dpi, vision
+        vision = OpenRouterVisionTranslator(
+            **common,
+            max_image_edge=max_image_edge,
+        )
+        full_page_vision = FullPageVisionTranslator(
+            **common,
+            max_image_edge=max(3000, max_image_edge),
+            dpi=max(200, min(300, ocr_dpi)),
+        )
+    analysis, units, all_page_lines, extraction, image_regions, full_page_images = _extract(
+        input_path, source_language, extraction_mode, ocr_dpi, vision, full_page_vision
     )
-    if not units and not image_regions:
+    if not units and not image_regions and not full_page_images:
         raise RuntimeError("No translatable source-language text or image text was found in the PDF.")
 
     cache = TranslationCache(settings.cache_db)
@@ -153,6 +170,7 @@ def translate_document_with_options(
             translations=translations,
             all_page_lines=all_page_lines,
             image_regions=image_regions,
+            full_page_images=full_page_images,
             min_font_scale=min_font_scale,
             font_scale_step=settings.font_scale_step,
             text_margin=text_margin,

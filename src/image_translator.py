@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import time
 from dataclasses import dataclass
 from hashlib import sha256
@@ -72,21 +73,117 @@ def _message_content(message) -> str:
     return str(content or "")
 
 
+def _strip_json_fences(content: str) -> str:
+    """Remove markdown fences and surrounding prose without changing JSON strings."""
+    text = (content or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    # Models sometimes add a short sentence before/after the JSON.
+    start = text.find("{")
+    if start > 0:
+        text = text[start:]
+    end = text.rfind("}")
+    if end >= 0 and end < len(text) - 1:
+        text = text[:end + 1]
+    return text.strip()
+
+
+_JSON_STRING = r'"(?:\\.|[^"\\])*"'
+
+
+def _repair_common_json_errors(content: str) -> str:
+    """
+    Repair only structural JSON mistakes commonly produced by vision LLMs.
+
+    This intentionally does NOT try to rewrite arbitrary text, because OCR
+    strings may legitimately contain punctuation, quotes, URLs, etc.
+    """
+    text = _strip_json_fences(content)
+
+    # Missing commas between an object/array value and the next key:
+    #   "confidence": 0.91
+    #   "bbox": [...]
+    #
+    # and:
+    #   "regions": [...]
+    #   "metadata": {...}
+    value_end = r'(?:' + _JSON_STRING + r'|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|\]|\})'
+    key = r'(' + _JSON_STRING + r'\s*:)'
+    text = re.sub(r'(' + value_end + r')\s*' + key, r'\1,\2', text)
+
+    # Missing commas between adjacent objects/arrays:
+    text = re.sub(r'(\}|\])\s*(\{|\[)', r'\1,\2', text)
+
+    # Missing comma after a complete string value before the next key.
+    text = re.sub(
+        r'(' + _JSON_STRING + r')\s*(' + _JSON_STRING + r'\s*:)',
+        r'\1,\2',
+        text,
+    )
+
+    # Missing comma after a number/bool/null before the next key.
+    text = re.sub(
+        r'(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)\s*('
+        + _JSON_STRING + r'\s*:)',
+        r'\1,\2',
+        text,
+    )
+    return text
+
+
 def _parse_json(content: str) -> dict:
-    content = (content or "").strip()
-    if content.startswith("```"):
-        parts = content.split("\n", 1)
-        content = parts[1] if len(parts) == 2 else content
-        if content.endswith("```"):
-            content = content[:-3].strip()
+    """
+    Parse OpenRouter vision JSON robustly.
+
+    Strategy:
+      1. strict JSON
+      2. extract the outer object
+      3. repair common missing-comma/fence errors
+      4. raise an actionable error if the model still returned unusable JSON
+    """
+    raw = _strip_json_fences(content)
+    attempts = [raw]
+
+    repaired = _repair_common_json_errors(raw)
+    if repaired != raw:
+        attempts.append(repaired)
+
+    # A second pass catches cases where the first repair creates a new
+    # adjacent-token boundary.
+    repaired2 = _repair_common_json_errors(repaired)
+    if repaired2 not in attempts:
+        attempts.append(repaired2)
+
+    last_error = None
+    for candidate in attempts:
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError as exc:
+            last_error = exc
+
+    # Last-resort extraction of the first balanced outer object. This helps
+    # when the model appends commentary after an otherwise valid JSON object.
+    decoder = json.JSONDecoder()
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        start = content.find("{")
-        end = content.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(content[start:end + 1])
-        raise
+        data, _ = decoder.raw_decode(raw)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError as exc:
+        last_error = exc
+
+    preview = raw[:1200].replace("\n", "\\n")
+    raise RuntimeError(
+        "OpenRouter vision model returned malformed JSON. "
+        f"JSON error: {last_error}. Response preview: {preview}"
+    ) from last_error
 
 
 def _valid_box(box, width, height):
@@ -152,7 +249,9 @@ For every readable text region, return its bounding box in ORIGINAL IMAGE PIXEL 
 Translate every detected text region faithfully. Preserve numbers, dates, codes, URLs, names,
 currencies and symbols. Keep short labels short. Do not summarize.
 
-Return ONLY valid JSON using exactly this top-level shape:
+Return ONLY valid JSON using exactly this top-level shape.
+Every object property MUST be separated by a comma. Do not omit commas.
+Do not use Markdown fences. Do not add commentary.
 {{
   "regions": [
     {{
@@ -170,38 +269,67 @@ Use an empty regions array when no readable text is present.
     def _call(self, image_b64: str, mime: str, width: int, height: int):
         data_url = f"data:{mime};base64,{image_b64}"
         last_error = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                return self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are an expert OCR and publication-quality document translator. Return JSON only.",
-                        },
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": self._prompt(width, height)},
-                                {"type": "image_url", "image_url": {"url": data_url}},
-                            ],
-                        },
-                    ],
-                    temperature=0,
-                    max_tokens=6000,
-                )
-            except RateLimitError as exc:
-                last_error = exc
-                if attempt >= self.max_retries:
-                    break
-                time.sleep(min(30, 2 ** attempt))
-            except APIStatusError as exc:
-                last_error = exc
-                status = getattr(exc, "status_code", None)
-                if status in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+
+        # OpenRouter supports structured response formats on compatible
+        # models. Prefer JSON-object mode so the vision model cannot drift
+        # into markdown/prose. If the selected model/provider rejects the
+        # parameter, transparently fall back to the normal request.
+        request_variants = [
+            {"type": "json_object"},
+            None,
+        ]
+
+        for response_format in request_variants:
+            for attempt in range(self.max_retries + 1):
+                try:
+                    kwargs = dict(
+                        model=self.model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are an expert OCR and publication-quality "
+                                    "document translator. Return ONLY the requested "
+                                    "JSON object. Never use Markdown fences or commentary."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": self._prompt(width, height)},
+                                    {"type": "image_url", "image_url": {"url": data_url}},
+                                ],
+                            },
+                        ],
+                        temperature=0,
+                        max_tokens=6000,
+                    )
+                    if response_format is not None:
+                        kwargs["response_format"] = response_format
+
+                    return self.client.chat.completions.create(**kwargs)
+
+                except RateLimitError as exc:
+                    last_error = exc
+                    if attempt >= self.max_retries:
+                        break
                     time.sleep(min(30, 2 ** attempt))
-                    continue
-                raise
+
+                except APIStatusError as exc:
+                    last_error = exc
+                    status = getattr(exc, "status_code", None)
+
+                    # A provider/model may not implement response_format.
+                    # In that case try the plain OpenRouter request instead
+                    # of treating it as an OCR failure.
+                    if response_format is not None and status in (400, 404, 422):
+                        break
+
+                    if status in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                        time.sleep(min(30, 2 ** attempt))
+                        continue
+                    raise
+
         raise RuntimeError(
             f"OpenRouter vision model '{self.model}' could not analyze the image after "
             f"{self.max_retries + 1} attempts. Make sure the selected model supports image input."
