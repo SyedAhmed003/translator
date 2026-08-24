@@ -1,11 +1,15 @@
 import os
 import sys
 import tempfile
+import gc
+import shutil
+import time
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
+import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -80,6 +84,30 @@ def get_models(api_key: str):
     return rows
 
 
+
+
+@st.cache_data(ttl=600)
+def get_image_models(api_key: str):
+    response = requests.get(
+        "https://openrouter.ai/api/v1/images/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    rows = []
+    for item in response.json().get("data", []):
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        arch = item.get("architecture") or {}
+        inputs = set(arch.get("input_modalities") or [])
+        outputs = set(arch.get("output_modalities") or [])
+        if model_id and "image" in inputs and "image" in outputs:
+            rows.append({"id": model_id, "name": item.get("name") or model_id})
+    rows.sort(key=lambda x: (x["id"] != "google/gemini-3.1-flash-image-preview", x["id"].lower()))
+    return rows
+
+
 try:
     model_catalog = get_models(api_key)
     model_error = None
@@ -151,17 +179,47 @@ st.markdown('<div class="section-title">🖼️ Image / OCR behavior</div>', uns
 q1, q2 = st.columns(2)
 with q1:
     use_vision_images = st.checkbox(
-        "Use OpenRouter vision for image text",
+        "Use AI image reconstruction for image PDFs",
         value=True,
-        help="Reads text embedded inside PDF images and full-page scans with the selected model, then overlays the translation inside the exact image-text boxes.",
+        help="Image-only/scanned pages are rendered as one complete page and edited by an OpenRouter image model. No OCR JSON/bounding-box pipeline is used.",
     )
 with q2:
     max_image_edge = st.selectbox(
         "Vision image size",
         [1600, 2000, 2400, 3000],
         index=2,
-        help="The original PDF image is never resized in the output. This only controls the copy sent to OpenRouter.",
+        help="Used by the embedded-image OCR path for mixed PDFs. Full-page image reconstruction uses the page raster directly.",
     )
+
+image_model_catalog = []
+image_model_error = None
+if use_vision_images:
+    try:
+        image_model_catalog = get_image_models(api_key)
+    except Exception as exc:
+        image_model_error = str(exc)
+
+image_model_by_display = {}
+for row in image_model_catalog:
+    display = f"{row['id']} 🖼️"
+    image_model_by_display[display] = row
+
+image_model_options = list(image_model_by_display.keys())
+if use_vision_images:
+    if image_model_options:
+        default_idx = next((i for i, x in enumerate(image_model_options) if x.startswith("google/gemini-3.1-flash-image-preview")), 0)
+        selected_image_model_display = st.selectbox(
+            "🖼️ Image reconstruction model",
+            image_model_options,
+            index=default_idx,
+            help="This model receives the complete page image and returns a complete translated image. For your current text model, Gemini 3.1 Flash Lite Image is the matching image-edit model.",
+        )
+        selected_image_model = image_model_by_display[selected_image_model_display]["id"]
+    else:
+        selected_image_model = "google/gemini-3.1-flash-image-preview"
+        st.warning(f"Could not load OpenRouter image models; using {selected_image_model}. {image_model_error or ''}")
+else:
+    selected_image_model = None
 
 st.markdown('<div class="section-title">🧠 Extraction</div>', unsafe_allow_html=True)
 e1, e2 = st.columns(2)
@@ -183,7 +241,7 @@ with l2:
     margin = st.slider("Text fitting margin", 0.0, 5.0, 0.0, 0.25, help="Keep at 0 for maximum source-PDF geometry fidelity.")
 
 if use_vision_images and selected_model and not model_is_vision:
-    st.warning("The selected OpenRouter model is not marked as image-capable. Choose a model with the 🖼️ badge to translate text embedded inside images/scans.")
+    st.info("Normal text translation uses the selected AI model. Image-only/scanned pages use the separate 🖼️ image reconstruction model above, so your text model does not need image-output capability.")
 
 if uploaded:
     st.success(f"Loaded: {uploaded.name}")
@@ -206,18 +264,14 @@ if uploaded:
         if missing:
             st.warning("Please select " + ", ".join(missing) + " before translating.")
             st.stop()
-        if use_vision_images and not model_is_vision:
-            st.error("Image OCR is enabled, but the selected model does not advertise image input. Pick a 🖼️ vision-capable OpenRouter model.")
-            st.stop()
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmpdir = Path(tmp)
-            input_path = tmpdir / uploaded.name
-            input_path.write_bytes(uploaded.getvalue())
-            output_path = tmpdir / f"{input_path.stem}_{target_language.lower().replace(' ', '_')}.pdf"
-            progress = st.progress(0)
-            status = st.empty()
-            try:
+        tmpdir = Path(tempfile.mkdtemp(prefix="pdf_translator_"))
+        input_path = tmpdir / uploaded.name
+        input_path.write_bytes(uploaded.getvalue())
+        output_path = tmpdir / f"{input_path.stem}_{target_language.lower().replace(' ', '_')}.pdf"
+        progress = st.progress(0)
+        status = st.empty()
+        try:
                 status.info("Analyzing PDF structure, native text, and embedded images...")
                 progress.progress(15)
                 result = translate_document_with_options(
@@ -234,6 +288,7 @@ if uploaded:
                     ocr_dpi=ocr_dpi,
                     use_vision_images=use_vision_images,
                     max_image_edge=max_image_edge,
+                    image_model=selected_image_model,
                 )
                 progress.progress(100)
                 status.success("Translation completed.")
@@ -246,12 +301,22 @@ if uploaded:
                 )
                 with st.expander("Translation report"):
                     st.json(result)
-            except Exception as exc:
-                progress.empty()
-                status.empty()
-                st.error(f"Translation failed: {exc}")
-                with st.expander("Technical details"):
-                    st.code(str(exc))
+        except Exception as exc:
+            progress.empty()
+            status.empty()
+            st.error(f"Translation failed: {exc}")
+            with st.expander("Technical details"):
+                st.code(str(exc))
+        finally:
+            # PyMuPDF can keep Windows file handles alive until page/doc objects
+            # are garbage-collected. Force collection before attempting cleanup.
+            gc.collect()
+            time.sleep(0.15)
+            try:
+                shutil.rmtree(tmpdir)
+            except PermissionError:
+                # Do not mask the actual translation result/error with WinError 32.
+                st.caption(f"Temporary working files retained for debugging: {tmpdir}")
 
 st.divider()
-st.caption("OpenRouter is used for text translation and, when enabled, multimodal OCR/translation of text embedded inside PDF images. The output keeps the original image objects at their source size and position.")
+st.caption("OpenRouter is used for native-text translation. For image-only/scanned pages, a dedicated image model edits the complete page image and the generated page is inserted at the original PDF page rectangle.")

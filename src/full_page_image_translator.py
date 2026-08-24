@@ -142,14 +142,69 @@ def _extract_json(content: str) -> dict:
 
 def _valid_box(box, width, height):
     try:
-        x0, y0, x1, y1 = [float(v) for v in box]
+        if isinstance(box, dict):
+            if all(k in box for k in ("x0", "y0", "x1", "y1")):
+                vals = [box["x0"], box["y0"], box["x1"], box["y1"]]
+            elif all(k in box for k in ("x", "y", "width", "height")):
+                vals = [box["x"], box["y"], float(box["x"]) + float(box["width"]), float(box["y"]) + float(box["height"])]
+            elif all(k in box for k in ("left", "top", "right", "bottom")):
+                vals = [box["left"], box["top"], box["right"], box["bottom"]]
+            else:
+                return None
+        else:
+            vals = list(box)
+        if len(vals) != 4:
+            return None
+        x0, y0, x1, y1 = [float(v) for v in vals]
     except Exception:
         return None
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    # Accept normalized 0..1 or Google-style 0..1000 coordinates as well as pixels.
+    vmax = max(abs(x0), abs(y0), abs(x1), abs(y1))
+    if vmax <= 1.00001:
+        x0, x1 = x0 * width, x1 * width
+        y0, y1 = y0 * height, y1 * height
+    elif vmax <= 1000.5 and (width > 1100 or height > 1100):
+        x0, x1 = x0 * width / 1000.0, x1 * width / 1000.0
+        y0, y1 = y0 * height / 1000.0, y1 * height / 1000.0
     x0, x1 = sorted((max(0.0, x0), min(float(width), x1)))
     y0, y1 = sorted((max(0.0, y0), min(float(height), y1)))
     if x1 - x0 < 2 or y1 - y0 < 2:
         return None
     return x0, y0, x1, y1
+
+
+def _region_items(data):
+    if not isinstance(data, dict):
+        return []
+    for key in ("regions", "text_regions", "items", "translations", "elements", "results"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+    # Some models return a single region object.
+    if any(k in data for k in ("bbox", "bounding_box", "box_2d", "source_text", "translation", "translated_text")):
+        return [data]
+    return []
+
+
+def _normalize_region(region):
+    if not isinstance(region, dict):
+        return None
+    box = (region.get("bbox") or region.get("bounding_box") or region.get("box") or
+           region.get("box_2d") or region.get("coordinates"))
+    source = (region.get("source_text") or region.get("source") or region.get("original_text") or
+              region.get("text") or region.get("ocr_text") or "").strip()
+    translation = (region.get("translation") or region.get("translated_text") or
+                   region.get("target_text") or region.get("translated") or
+                   region.get("target") or "").strip()
+    if not box or not translation:
+        return None
+    try:
+        confidence = float(region.get("confidence", region.get("score", 0.0)))
+    except Exception:
+        confidence = 0.0
+    return box, source, translation, confidence
 
 
 def _render_page(page: fitz.Page, dpi: int) -> tuple[Image.Image, float]:
@@ -399,28 +454,64 @@ translations must stay short enough to fit the original visual region.
 
         result = []
         inv = 1.0 / max(scale, 1e-9)
-        for region in data.get("regions", []) if isinstance(data, dict) else []:
-            if not isinstance(region, dict):
+        for raw_region in _region_items(data):
+            normalized = _normalize_region(raw_region)
+            if not normalized:
                 continue
-            box = _valid_box(region.get("bbox"), sent_size[0], sent_size[1])
-            source = str(region.get("source_text", "")).strip()
-            translation = str(region.get("translation", "")).strip()
-            if not box or not source or not translation:
+            raw_box, source, translation, confidence = normalized
+            box = _valid_box(raw_box, sent_size[0], sent_size[1])
+            if not box or not translation:
                 continue
             mapped = _valid_box(tuple(v * inv for v in box), image.width, image.height)
             if not mapped:
                 continue
-            try:
-                confidence = max(0.0, min(1.0, float(region.get("confidence", 0.0))))
-            except Exception:
-                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
             result.append(FullPageRegion(mapped, source, translation, confidence))
 
         if not result:
-            raise RuntimeError(
-                "Gemini/OpenRouter returned JSON but no usable translated text regions were found. "
-                f"Last response: {last_debug}"
+            # One final schema deliberately uses the most common Gemini OCR field names.
+            compact_prompt = (
+                f"Read the page image and translate every readable {self.source_language} text region "
+                f"into {self.target_language}. Return ONLY JSON. Use this exact shape: "
+                '{"regions":[{"bbox":[x0,y0,x1,y1],"source_text":"...","translation":"..."}]} ' 
+                f"Use pixel coordinates for an image of {sent_size[0]} by {sent_size[1]} pixels. "
+                "Do not return markdown or prose. For bbox, x0,y0 is top-left and x1,y1 is bottom-right."
             )
+            try:
+                data_url = f"data:image/png;base64,{b64}"
+                retry = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "OCR translator. Return only JSON."},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": compact_prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ]},
+                    ],
+                    temperature=0,
+                    max_tokens=16000,
+                )
+                retry_content = _message_content(retry.choices[0].message)
+                retry_debug = _response_debug(retry)
+                retry_data = _extract_json(retry_content)
+                for raw_region in _region_items(retry_data):
+                    normalized = _normalize_region(raw_region)
+                    if not normalized:
+                        continue
+                    raw_box, source, translation, confidence = normalized
+                    box = _valid_box(raw_box, sent_size[0], sent_size[1])
+                    if not box or not translation:
+                        continue
+                    mapped = _valid_box(tuple(v * inv for v in box), image.width, image.height)
+                    if mapped:
+                        result.append(FullPageRegion(mapped, source, translation, max(0.0, min(1.0, confidence))))
+                if not result:
+                    raise RuntimeError(f"retry returned no usable regions ({retry_debug})")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Gemini/OpenRouter returned JSON but no usable translated text regions were found. "
+                    f"Initial response: {last_debug}. Final retry: {exc}"
+                ) from exc
         return result
 
     @staticmethod

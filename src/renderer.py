@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import io
 import math
+import gc
 from typing import TYPE_CHECKING
 import pymupdf as fitz
 from PIL import Image, ImageDraw, ImageFont
@@ -486,8 +487,10 @@ def render_translated_pdf(
     min_font_scale=0.60,
     font_scale_step=0.02,
     text_margin=0.0,
+    full_page_images=None,
 ):
     doc = fitz.open(input_path)
+    full_page_images = full_page_images or {}
     report = {
         "input": str(input_path),
         "output": str(output_path),
@@ -505,12 +508,40 @@ def render_translated_pdf(
     for region in image_regions:
         image_by_page.setdefault(region.page_index, []).append(region)
 
-    page_indexes = sorted(set(by_page) | set(image_by_page))
+    page_indexes = sorted(set(by_page) | set(image_by_page) | set(full_page_images))
     for page_index in page_indexes:
         page_units = by_page.get(page_index, [])
         page = doc[page_index]
         all_lines = (all_page_lines or {}).get(page_index, [])
         grids = detect_table_grids(page)
+
+        # Full-page Gemini image path. A scanned page is rebuilt as one complete
+        # generated image; do not run the old per-image OCR/text overlay path.
+        if page_index in full_page_images:
+            fp = full_page_images[page_index]
+            png = fp.get("png") if isinstance(fp, dict) else None
+            if not png:
+                raise RuntimeError(f"Full-page image result for page {page_index + 1} contains no PNG data.")
+
+            # Remove the original page visuals while preserving the page rectangle.
+            page.apply_redactions()
+            rect = page.rect
+            page.insert_image(rect, stream=png, keep_proportion=False, overlay=True)
+
+            page_report = {
+                "page": page_index + 1,
+                "units": [],
+                "image_text_regions": [],
+                "full_page_image": {
+                    "model": fp.get("model") if isinstance(fp, dict) else None,
+                    "source_size": fp.get("source_size") if isinstance(fp, dict) else None,
+                    "output_size": fp.get("output_size") if isinstance(fp, dict) else None,
+                    "passes": fp.get("passes") if isinstance(fp, dict) else None,
+                },
+                "validation": {"pass": True, "skipped": True},
+            }
+            report["pages"].append(page_report)
+            continue
 
         # GLOBAL TEXT CLEANUP:
         # Remove the complete original text layer once. This prevents the
