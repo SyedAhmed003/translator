@@ -4,3 +4,4 @@ __pycache__/
 data/*.sqlite3
 output/
 *.report.json
+.venv/
