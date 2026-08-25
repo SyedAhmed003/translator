@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import gc
@@ -20,6 +19,7 @@ load_dotenv(ROOT / ".env")
 
 from src.pipeline import translate_document_with_options
 from src.excel_pipeline import translate_excel_workbook
+from src.pptx_pipeline import translate_pptx
 
 
 st.set_page_config(
@@ -56,7 +56,7 @@ st.markdown(
     """
     <div class="hero">
         <h1>🌐 Document Translator Studio</h1>
-        <p>OpenRouter translation for PDF and Excel with native-content preservation and image-aware processing.</p>
+        <p>OpenRouter translation for PDF, Excel and PowerPoint with native-content preservation and image-aware processing.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -176,25 +176,25 @@ else:
         0,
     )
     selected_image_model_display = st.selectbox(
-        "🖼️ Excel image model",
+        "🖼️ Image generation model",
         img_options,
         index=default_img,
-        help="Used only for images embedded in Excel workbooks. The generated image is written back using the original Excel image anchor and displayed size.",
+        help="Used for embedded/scanned images in Excel and PowerPoint. The generated image replaces only the original media while its existing placement and displayed size are preserved.",
     )
     selected_image_model = img_model_by_display[selected_image_model_display]["id"]
 
 st.markdown('<div class="section-title">📁 Document</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader(
-    "Upload PDF or Excel",
-    type=["pdf", "xlsx", "xls"],
-    help="PDF, .xlsx and legacy .xls are supported.",
+    "Upload PDF, Excel or PowerPoint",
+    type=["pdf", "xlsx", "xls", "pptx"],
+    help="PDF, .xlsx/.xls and .pptx are supported.",
 )
 
 file_type = Path(uploaded.name).suffix.lower() if uploaded else ""
 
 if model_error:
     st.warning(f"OpenRouter model catalog error: {model_error}")
-if image_error and file_type in {".xlsx", ".xls"}:
+if image_error and file_type in {".xlsx", ".xls", ".pptx"}:
     st.warning(f"OpenRouter image model catalog error: {image_error}")
 
 if file_type in {".xlsx", ".xls"}:
@@ -219,6 +219,43 @@ if file_type in {".xlsx", ".xls"}:
             disabled=True,
             help="Formulas are always preserved by this pipeline.",
         )
+
+elif file_type == ".pptx":
+    st.markdown('<div class="section-title">🎞️ PowerPoint processing</div>', unsafe_allow_html=True)
+
+    ptx1, ptx2, ptx3 = st.columns(3)
+    with ptx1:
+        translate_pptx_text = st.checkbox(
+            "Translate native PPTX text",
+            value=True,
+            help=(
+                "Translates editable PowerPoint text including titles, text boxes, "
+                "tables, shapes, grouped-shape text and DrawingML diagram/SmartArt text."
+            ),
+        )
+    with ptx2:
+        translate_pptx_images = st.checkbox(
+            "Translate embedded/scanned images",
+            value=True,
+            help=(
+                "Uses the selected image-generation model for image-based text. "
+                "The generated image replaces the original media while the existing "
+                "PowerPoint relationship and placement are preserved."
+            ),
+        )
+    with ptx3:
+        translate_pptx_diagrams = st.checkbox(
+            "Translate diagrams / SmartArt",
+            value=True,
+            help="Translates text stored in PowerPoint diagram XML without rebuilding the diagram.",
+        )
+
+    st.info(
+        "PowerPoint uses one automatic pipeline: editable text is translated as "
+        "PowerPoint text, while text embedded in scanned/images is translated "
+        "through the selected image model. Mixed slides are supported."
+    )
+
 else:
     st.markdown('<div class="section-title">🖼️ PDF image / OCR behavior</div>', unsafe_allow_html=True)
     p1, p2 = st.columns(2)
@@ -266,6 +303,8 @@ if uploaded:
             missing.append("target language")
         if file_type in {".xlsx", ".xls"} and translate_excel_images and not selected_image_model:
             missing.append("Excel image model")
+        if file_type == ".pptx" and translate_pptx_images and not selected_image_model:
+            missing.append("PowerPoint image model")
 
         if missing:
             st.warning("Please select " + ", ".join(missing) + " before translating.")
@@ -279,7 +318,42 @@ if uploaded:
         status = st.empty()
 
         try:
-            if file_type in {".xlsx", ".xls"}:
+            if file_type == ".pptx":
+                status.info(
+                    "Analyzing PowerPoint text, shapes, diagrams, and embedded images..."
+                )
+                progress.progress(15)
+
+                output_path = tmpdir / (
+                    f"{input_path.stem}_"
+                    f"{target_language.lower().replace(' ', '_')}.pptx"
+                )
+
+                result = translate_pptx(
+                    input_path=str(input_path),
+                    output_path=str(output_path),
+                    api_key=api_key,
+                    text_model=selected_model,
+                    source_language=source_language,
+                    target_language=target_language,
+                    image_model=selected_image_model,
+                    translate_native_text=translate_pptx_text,
+                    translate_embedded_images=translate_pptx_images,
+                    translate_diagrams=translate_pptx_diagrams,
+                )
+
+                progress.progress(100)
+                status.success("PowerPoint translation completed.")
+
+                st.download_button(
+                    "⬇️ Download translated PowerPoint",
+                    data=output_path.read_bytes(),
+                    file_name=output_path.name,
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    use_container_width=True,
+                )
+
+            elif file_type in {".xlsx", ".xls"}:
                 status.info("Analyzing workbook sheets, native cells, and embedded images...")
                 progress.progress(15)
 
@@ -361,7 +435,7 @@ if uploaded:
 
 st.divider()
 st.caption(
-    "OpenRouter handles text translation and vision/image processing. "
-    "Excel native cells keep workbook structure; embedded Excel images are "
+    "OpenRouter handles text translation and vision/image processing for PDF, Excel and PowerPoint. "
+    "Excel native cells keep workbook structure; embedded Excel images and PowerPoint image media are "
     "translated by a Gemini image model and written back to the original image area."
 )
