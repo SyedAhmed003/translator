@@ -20,6 +20,7 @@ load_dotenv(ROOT / ".env")
 from src.pipeline import translate_document_with_options
 from src.excel_pipeline import translate_excel_workbook
 from src.pptx_pipeline import translate_pptx
+from src.word_pipeline import translate_word
 
 
 st.set_page_config(
@@ -172,7 +173,7 @@ if not img_options:
 else:
     default_img = next(
         (i for i, x in enumerate(img_options)
-         if x.startswith("google/gemini-3.1-flash-image-preview")),
+         if x.startswith("google/gemini-3.1-flash-lite-image")),
         0,
     )
     selected_image_model_display = st.selectbox(
@@ -186,8 +187,8 @@ else:
 st.markdown('<div class="section-title">📁 Document</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader(
     "Upload PDF, Excel or PowerPoint",
-    type=["pdf", "xlsx", "xls", "pptx"],
-    help="PDF, .xlsx/.xls and .pptx are supported.",
+    type=["pdf", "xlsx", "xls", "pptx", "docx"],
+    help="PDF, .xlsx/.xls, .pptx and .docx are supported.",
 )
 
 file_type = Path(uploaded.name).suffix.lower() if uploaded else ""
@@ -219,6 +220,37 @@ if file_type in {".xlsx", ".xls"}:
             disabled=True,
             help="Formulas are always preserved by this pipeline.",
         )
+
+elif file_type == ".docx":
+    st.markdown('<div class="section-title">📝 Word processing</div>', unsafe_allow_html=True)
+    w1, w2 = st.columns(2)
+
+    with w1:
+        translate_word_text = st.checkbox(
+            "Translate native Word text",
+            value=True,
+            help=(
+                "Translates paragraphs, tables, headers, footers, footnotes, "
+                "endnotes, comments, text boxes and DrawingML text while preserving "
+                "the original Word structure and formatting."
+            ),
+        )
+
+    with w2:
+        translate_word_images = st.checkbox(
+            "Translate embedded/scanned images",
+            value=True,
+            help=(
+                "Sends raster images in the Word file to the selected Gemini image "
+                "model. The output replaces only the image bytes, preserving Word "
+                "position, size and wrapping."
+            ),
+        )
+
+    st.info(
+        "Mixed Word documents are supported: editable Word content uses the text "
+        "model, while embedded/scanned images use the Gemini image model."
+    )
 
 elif file_type == ".pptx":
     st.markdown('<div class="section-title">🎞️ PowerPoint processing</div>', unsafe_allow_html=True)
@@ -305,6 +337,8 @@ if uploaded:
             missing.append("Excel image model")
         if file_type == ".pptx" and translate_pptx_images and not selected_image_model:
             missing.append("PowerPoint image model")
+        if file_type == ".docx" and translate_word_images and not selected_image_model:
+            missing.append("Word image model")
 
         if missing:
             st.warning("Please select " + ", ".join(missing) + " before translating.")
@@ -318,7 +352,41 @@ if uploaded:
         status = st.empty()
 
         try:
-            if file_type == ".pptx":
+            if file_type == ".docx":
+                status.info(
+                    "Analyzing Word paragraphs, tables, headers, text boxes and embedded images..."
+                )
+                progress.progress(15)
+
+                output_path = tmpdir / (
+                    f"{input_path.stem}_"
+                    f"{target_language.lower().replace(' ', '_')}.docx"
+                )
+
+                result = translate_word(
+                    input_path=str(input_path),
+                    output_path=str(output_path),
+                    api_key=api_key,
+                    text_model=selected_model,
+                    source_language=source_language,
+                    target_language=target_language,
+                    image_model=selected_image_model,
+                    translate_native_text=translate_word_text,
+                    translate_images=translate_word_images,
+                )
+
+                progress.progress(100)
+                status.success("Word translation completed.")
+
+                st.download_button(
+                    "⬇️ Download translated Word",
+                    data=output_path.read_bytes(),
+                    file_name=output_path.name,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+
+            elif file_type == ".pptx":
                 status.info(
                     "Analyzing PowerPoint text, shapes, diagrams, and embedded images..."
                 )
