@@ -291,7 +291,7 @@ Return ONE COMPLETE EDITED IMAGE of the page.
             "modalities": ["image", "text"],
             "image_config": {
                 "aspect_ratio": aspect,
-                "image_size": "2K",
+                "image_size": "1K",
             },
         }
 

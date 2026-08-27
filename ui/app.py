@@ -115,7 +115,7 @@ def get_image_models(api_key: str):
                 "name": item.get("name") or model_id,
             })
     rows.sort(key=lambda x: (
-        x["id"] != "google/gemini-3.1-flash-image-preview",
+        x["id"] != "google/gemini-3.1-flash-lite-image",
         x["id"].lower(),
     ))
     return rows

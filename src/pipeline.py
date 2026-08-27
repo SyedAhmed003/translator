@@ -150,7 +150,7 @@ def translate_document_with_options(
         )
         full_page_vision = OpenRouterImagePageTranslator(
             api_key=api_key,
-            model=image_model or "google/gemini-3.1-flash-image-preview",
+            model=image_model or "google/gemini-3.1-flash-lite-image",
             source_language=source_language,
             target_language=target_language,
             dpi=max(200, min(300, ocr_dpi)),
@@ -197,7 +197,7 @@ def translate_document_with_options(
             "extraction": extraction,
             "analysis": analysis,
             "model": model,
-            "image_model": image_model or ("google/gemini-3.1-flash-image-preview" if use_vision_images else None),
+            "image_model": image_model or ("google/gemini-3.1-flash-lite-image" if use_vision_images else None),
             "source_language": source_language,
             "target_language": target_language,
         }
