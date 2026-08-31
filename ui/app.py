@@ -21,6 +21,7 @@ from src.pipeline import translate_document_with_options
 from src.excel_pipeline import translate_excel_workbook
 from src.pptx_pipeline import translate_pptx
 from src.word_pipeline import translate_word
+from src.standalone_image_translator import translate_image
 
 
 st.set_page_config(
@@ -187,15 +188,23 @@ else:
 st.markdown('<div class="section-title">📁 Document</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader(
     "Upload PDF, Excel or PowerPoint",
-    type=["pdf", "xlsx", "xls", "pptx", "docx"],
-    help="PDF, .xlsx/.xls, .pptx and .docx are supported.",
+    type=["pdf", "xlsx", "xls", "pptx", "docx", "png", "jpg", "jpeg", "webp"],
+    help="PDF, .xlsx/.xls, .pptx, .docx and PNG/JPG/JPEG/WEBP images are supported.",
 )
 
 file_type = Path(uploaded.name).suffix.lower() if uploaded else ""
 
+if file_type in {".png", ".jpg", ".jpeg", ".webp"}:
+    st.markdown('<div class="section-title">🖼️ Image translation</div>', unsafe_allow_html=True)
+    st.info(
+        "Upload a standalone image. The selected image model will translate "
+        "the visible source-language text and return a downloadable PNG."
+    )
+
+
 if model_error:
     st.warning(f"OpenRouter model catalog error: {model_error}")
-if image_error and file_type in {".xlsx", ".xls", ".pptx"}:
+if image_error and file_type in {".xlsx", ".xls", ".pptx", ".docx", ".png", ".jpg", ".jpeg", ".webp"}:
     st.warning(f"OpenRouter image model catalog error: {image_error}")
 
 if file_type in {".xlsx", ".xls"}:
@@ -339,6 +348,8 @@ if uploaded:
             missing.append("PowerPoint image model")
         if file_type == ".docx" and translate_word_images and not selected_image_model:
             missing.append("Word image model")
+        if file_type in {".png", ".jpg", ".jpeg", ".webp"} and not selected_image_model:
+            missing.append("Image model")
 
         if missing:
             st.warning("Please select " + ", ".join(missing) + " before translating.")
@@ -352,7 +363,37 @@ if uploaded:
         status = st.empty()
 
         try:
-            if file_type == ".docx":
+            if file_type in {".png", ".jpg", ".jpeg", ".webp"}:
+                status.info("Translating uploaded image with the selected image model...")
+                progress.progress(20)
+
+                image_output = translate_image(
+                    input_bytes=uploaded.getvalue(),
+                    api_key=api_key,
+                    source_language=source_language,
+                    target_language=target_language,
+                    model=selected_image_model,
+                )
+
+                output_name = (
+                    f"{input_path.stem}_"
+                    f"{target_language.lower().replace(' ', '_')}.png"
+                )
+                output_path = tmpdir / output_name
+                output_path.write_bytes(image_output)
+
+                progress.progress(100)
+                status.success("Image translation completed.")
+
+                st.download_button(
+                    "⬇️ Download translated image",
+                    data=image_output,
+                    file_name=output_name,
+                    mime="image/png",
+                    use_container_width=True,
+                )
+
+            elif file_type == ".docx":
                 status.info(
                     "Analyzing Word paragraphs, tables, headers, text boxes and embedded images..."
                 )
